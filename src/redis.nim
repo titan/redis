@@ -31,7 +31,7 @@
 ##
 ##    assert(value == "Hello, World")
 
-import net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options
+import net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options, tables
 
 const
   redisNil* = "\0\0"
@@ -70,6 +70,20 @@ type
 
   RedisCursor* = ref object
     position*: BiggestInt
+
+  RedisKind = enum
+    rkInteger,
+    rkStatus,
+    rkString,
+    rkList
+
+  RedisCell* = object
+    case kind: RedisKind
+    of rkInteger: intVal*: RedisInteger
+    of rkStatus: statusVal*: RedisStatus
+    of rkString: strVal*: RedisString
+    of rkList: listVal*: seq[RedisCell]
+
 
 proc newPipeline(): Pipeline =
   new(result)
@@ -324,6 +338,52 @@ proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
 
   r.pipeline.expected -= 1
   return res
+
+proc parseArray(r: Redis | AsyncRedis, countLine: string): Future[RedisCell] {.multisync.}
+proc parseNext(r: Redis | AsyncRedis): Future[RedisCell] {.multisync.} =
+  let line = await r.managedRecvLine()
+
+  if line.len == 0:
+    return RedisCell(kind: rkList, listVal: @[])
+
+  case line[0]:
+    of '+', '-':
+      result = RedisCell(kind: rkStatus, statusVal: r.parseStatus(line))
+    of ':':
+      result = RedisCell(kind: rkInteger, intVal: r.parseInteger(line))
+    of '$':
+      let x = await r.readSingleString(line, true)
+      result = RedisCell(kind: rkString, strVal: x.get(redisNil))
+    of '*':
+      result = await r.parseArray(line)
+    else:
+      raiseReplyError(r, "parseNext failed on line: " & line)
+
+  r.pipeline.expected -= 1
+
+proc parseArray(r: Redis | AsyncRedis, countLine: string): Future[RedisCell] {.multisync.} =
+  if countLine[0] != '*':
+    raiseInvalidReply(r, '*', countLine[0])
+
+  var numElems = parseInt(countLine.substr(1))
+  var items: seq[RedisCell] = @[]
+
+  if numElems == -1:
+    result = RedisCell(kind: rkList, listVal: items)
+    return result
+
+  for i in 0..numElems-1:
+    var parsed = await r.parseNext()
+    items.add(parsed)
+
+  result = RedisCell(kind: rkList, listVal: items)
+
+proc parseArray(r: Redis | AsyncRedis): Future[RedisCell] {.multisync.} =
+  let line = await r.managedRecvLine()
+  if line.len == 0:
+    return RedisCell(kind: rkList, listVal: @[])
+
+  result = await r.parseArray(line)
 
 proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] {.multisync.} =
   ## Send buffered commands, clear buffer, return results
@@ -1150,6 +1210,153 @@ proc nextMessage*(r: AsyncRedis): Future[RedisMessage] {.async.} =
   result = RedisMessage()
   result.channel = msg[1]
   result.message = msg[2]
+
+# Stream
+
+proc xadd*(r: Redis | AsyncRedis, key: string, maxlen: int, id: string,
+           fieldValues: seq[tuple[field, value: string]]): Future[RedisString] {.multisync.} =
+  ## Appends the specified stream entry to the stream at the specified key
+  var args = @[key]
+  if maxlen > 0:
+    args.add("MAXLEN")
+    args.add("~")
+    args.add($maxlen)
+  args.add(id)
+  for field, value in items(fieldValues):
+    args.add(field)
+    args.add(value)
+  await r.sendCommand("XADD", args)
+  result = await r.readBulkString()
+
+proc xadd*(r: Redis | AsyncRedis, key: string, id: string,
+           fieldValues: seq[tuple[field, value: string]]): Future[RedisString] {.multisync.} =
+  ## Appends the specified stream entry to the stream at the specified key
+  result = await r.xadd(key, 0, id, fieldValues)
+
+proc xadd*(r: Redis | AsyncRedis, key: string, maxlen: int,
+           fieldValues: seq[tuple[field, value: string]]): Future[RedisString] {.multisync.} =
+  ## Appends the specified stream entry to the stream at the specified key
+  result = await r.xadd(key, maxlen, "*", fieldValues)
+
+proc xadd*(r: Redis | AsyncRedis, key: string,
+           fieldValues: seq[tuple[field, value: string]]): Future[RedisString] {.multisync.} =
+  ## Appends the specified stream entry to the stream at the specified key
+  result = await r.xadd(key, 0, "*", fieldValues)
+
+proc xdel*(r: Redis | AsyncRedis, key: string, ids: seq[string]): Future[RedisInteger] {.multisync.} =
+  ## Removes the specified entries from a stream, and returns the
+  ## number of entries deleted, that may be different from the number
+  ## of IDs passed to the command in case certain IDs do not exist.
+  await r.sendCommand("XDEL", key, ids)
+  result = await r.readInteger()
+
+proc xdel*(r: Redis | AsyncRedis, key: string, id: string): Future[RedisInteger] {.multisync.} =
+  result = await r.xdel(key, @[id])
+
+proc xlen*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisync.} =
+  ## Returns the number of entries inside a stream. If the specified
+  ## key does not exist the command returns zero, as if the stream was
+  ## empty.
+  await r.sendCommand("XLEN", key)
+  result = await r.readInteger()
+
+proc array2stream(x: RedisCell): Table[RedisString, Table[RedisString, RedisString]] =
+  var datas: Table[RedisString, Table[RedisString, RedisString]] = initTable[RedisString, Table[RedisString, RedisString]]()
+  for data in x.listVal:
+    let id = data.listVal[0].strVal
+    var fieldValues: Table[RedisString, RedisString] = initTable[RedisString, RedisString]()
+    var
+      idx = 0
+      idxlen = len(data.listVal[1].listVal) shr 1
+    while idx < idxlen:
+      let
+        field: RedisString = data.listVal[1].listVal[idx shl 1].strVal
+        value: RedisCell = data.listVal[1].listVal[(idx shl 1) + 1]
+      case value.kind:
+        of rkInteger:
+          fieldValues[field] = $value.intVal
+        of rkStatus:
+          fieldValues[field] = $value.statusVal
+        of rkString:
+          fieldValues[field] = value.strVal
+        of rkList:
+          fieldValues[field] = $value.listVal
+      idx += 1
+    datas[id] = fieldValues
+  return datas
+
+proc xrange*(r: Redis | AsyncRedis, key: string, start, stop: string, count: int): Future[Table[RedisString, Table[RedisString, RedisString]]] {.multisync.} =
+  ## The command returns the stream entries matching a given range of
+  ## IDs. The range is specified by a minimum and maximum ID. All the
+  ## entires having an ID between the two specified or exactly one of
+  ## the two IDs specified (closed interval) are returned.
+  var args = @[key, start, stop]
+  if count > 0:
+    args.add("COUNT")
+    args.add($count)
+  await r.sendCommand("XRANGE", args)
+  result = array2stream(await r.parseArray())
+
+proc xrange*(r: Redis | AsyncRedis, key: string, start, stop: string): Future[Table[RedisString, Table[RedisString, RedisString]]] {.multisync.} =
+  ## The command returns the stream entries matching a given range of
+  ## IDs. The range is specified by a minimum and maximum ID. All the
+  ## entires having an ID between the two specified or exactly one of
+  ## the two IDs specified (closed interval) are returned.
+  result = await r.xrange(key, start, stop, 0)
+
+proc xrevrange*(r: Redis | AsyncRedis, key: string, stop, start: string, count: int): Future[Table[RedisString, Table[RedisString, RedisString]]] {.multisync.} =
+  ## This command is exactly like XRANGE, but with the notable
+  ## difference of returning the entries in reverse order, and also
+  ## taking the start-end range in reverse order.
+  var args = @[key, start, stop]
+  if count > 0:
+    args.add("COUNT")
+    args.add($count)
+  await r.sendCommand("XREVRANGE", args)
+  result = array2stream(await r.parseArray())
+
+proc xrevrange*(r: Redis | AsyncRedis, key: string, stop, start: string): Future[Table[RedisString, Table[RedisString, RedisString]]] {.multisync.} =
+  ## This command is exactly like XRANGE, but with the notable
+  ## difference of returning the entries in reverse order, and also
+  ## taking the start-end range in reverse order.
+  result = await r.xrevrange(key, stop, start, 0)
+
+proc xread*(r: Redis | AsyncRedis, keys: seq[string], ids: seq[string],
+            count: int, timeout: int): Future[Table[RedisString, Table[RedisString, Table[RedisString, RedisString]]]] {.multisync.} =
+  ## Read data from one or multiple streams, only returning entries
+  ## with an ID greater than the last received ID reported by the
+  ## caller.
+  var args: seq[string] = @[]
+  if count > 0:
+    args.add("COUNT")
+    args.add($count)
+  if timeout > 0:
+    args.add("BLOCK")
+    args.add($timeout)
+  args.add("STREAMS")
+  for key in keys:
+    args.add(key)
+  for id in ids:
+    args.add(id)
+  await r.sendCommand("XREAD", args)
+  let x = await r.parseArray()
+  var top: Table[RedisString, Table[RedisString, Table[RedisString, RedisString]]] = initTable[RedisString, Table[RedisString, Table[RedisString, RedisString]]]()
+  for item in x.listVal:
+    let
+      key = item.listVal[0].strVal
+      datas: Table[RedisString, Table[RedisString, RedisString]] = array2stream(item.listVal[1])
+    top[key] = datas
+  return top
+
+proc xread*(r: Redis | AsyncRedis, key: string, id: string,
+            count: int, timeout: int): Future[Table[RedisString, Table[RedisString, Table[RedisString, RedisString]]]] {.multisync.} =
+  result = await r.xread(@[key], @[id], count, timeout)
+
+proc xtrim*(r: Redis | AsyncRedis, key: string, count: int): Future[RedisInteger] {.multisync.} =
+  ## XTRIM trims the stream to a given number of items, evicting older
+  ## items (items with lower IDs) if needed.
+  await r.sendCommand("XTRIM", key, @["MAXLEN", "~", $count])
+  result = await r.readInteger()
 
 # Transactions
 
