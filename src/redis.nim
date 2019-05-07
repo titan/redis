@@ -384,6 +384,7 @@ proc parseArray(r: Redis | AsyncRedis): Future[RedisCell] {.multisync.} =
     return RedisCell(kind: rkList, listVal: @[])
 
   result = await r.parseArray(line)
+  finaliseCommand(r)
 
 proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] {.multisync.} =
   ## Send buffered commands, clear buffer, return results
