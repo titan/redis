@@ -1261,11 +1261,11 @@ proc xlen*(r: Redis | AsyncRedis, key: string): Future[RedisInteger] {.multisync
   await r.sendCommand("XLEN", key)
   result = await r.readInteger()
 
-proc array2stream(x: RedisCell): Table[RedisString, Table[RedisString, RedisString]] =
-  var datas: Table[RedisString, Table[RedisString, RedisString]] = initTable[RedisString, Table[RedisString, RedisString]]()
+proc array2stream(x: RedisCell): TableRef[RedisString, TableRef[RedisString, RedisString]] =
+  var datas: TableRef[RedisString, TableRef[RedisString, RedisString]] = newTable[RedisString, TableRef[RedisString, RedisString]]()
   for data in x.listVal:
     let id = data.listVal[0].strVal
-    var fieldValues: Table[RedisString, RedisString] = initTable[RedisString, RedisString]()
+    var fieldValues: TableRef[RedisString, RedisString] = newTable[RedisString, RedisString]()
     var
       idx = 0
       idxlen = len(data.listVal[1].listVal) shr 1
@@ -1286,7 +1286,7 @@ proc array2stream(x: RedisCell): Table[RedisString, Table[RedisString, RedisStri
     datas[id] = fieldValues
   return datas
 
-proc xrange*(r: Redis | AsyncRedis, key: string, start, stop: string, count: int): Future[Table[RedisString, Table[RedisString, RedisString]]] {.multisync.} =
+proc xrange*(r: Redis | AsyncRedis, key: string, start, stop: string, count: int): Future[TableRef[RedisString, TableRef[RedisString, RedisString]]] {.multisync.} =
   ## The command returns the stream entries matching a given range of
   ## IDs. The range is specified by a minimum and maximum ID. All the
   ## entires having an ID between the two specified or exactly one of
@@ -1298,14 +1298,14 @@ proc xrange*(r: Redis | AsyncRedis, key: string, start, stop: string, count: int
   await r.sendCommand("XRANGE", args)
   result = array2stream(await r.parseArray())
 
-proc xrange*(r: Redis | AsyncRedis, key: string, start, stop: string): Future[Table[RedisString, Table[RedisString, RedisString]]] {.multisync.} =
+proc xrange*(r: Redis | AsyncRedis, key: string, start, stop: string): Future[TableRef[RedisString, TableRef[RedisString, RedisString]]] {.multisync.} =
   ## The command returns the stream entries matching a given range of
   ## IDs. The range is specified by a minimum and maximum ID. All the
   ## entires having an ID between the two specified or exactly one of
   ## the two IDs specified (closed interval) are returned.
   result = await r.xrange(key, start, stop, 0)
 
-proc xrevrange*(r: Redis | AsyncRedis, key: string, stop, start: string, count: int): Future[Table[RedisString, Table[RedisString, RedisString]]] {.multisync.} =
+proc xrevrange*(r: Redis | AsyncRedis, key: string, stop, start: string, count: int): Future[TableRef[RedisString, TableRef[RedisString, RedisString]]] {.multisync.} =
   ## This command is exactly like XRANGE, but with the notable
   ## difference of returning the entries in reverse order, and also
   ## taking the start-end range in reverse order.
@@ -1316,14 +1316,14 @@ proc xrevrange*(r: Redis | AsyncRedis, key: string, stop, start: string, count: 
   await r.sendCommand("XREVRANGE", args)
   result = array2stream(await r.parseArray())
 
-proc xrevrange*(r: Redis | AsyncRedis, key: string, stop, start: string): Future[Table[RedisString, Table[RedisString, RedisString]]] {.multisync.} =
+proc xrevrange*(r: Redis | AsyncRedis, key: string, stop, start: string): Future[TableRef[RedisString, TableRef[RedisString, RedisString]]] {.multisync.} =
   ## This command is exactly like XRANGE, but with the notable
   ## difference of returning the entries in reverse order, and also
   ## taking the start-end range in reverse order.
   result = await r.xrevrange(key, stop, start, 0)
 
 proc xread*(r: Redis | AsyncRedis, keys: seq[string], ids: seq[string],
-            count: int, timeout: int): Future[Table[RedisString, Table[RedisString, Table[RedisString, RedisString]]]] {.multisync.} =
+            count: int, timeout: int): Future[TableRef[RedisString, TableRef[RedisString, TableRef[RedisString, RedisString]]]] {.multisync.} =
   ## Read data from one or multiple streams, only returning entries
   ## with an ID greater than the last received ID reported by the
   ## caller.
@@ -1341,16 +1341,16 @@ proc xread*(r: Redis | AsyncRedis, keys: seq[string], ids: seq[string],
     args.add(id)
   await r.sendCommand("XREAD", args)
   let x = await r.parseArray()
-  var top: Table[RedisString, Table[RedisString, Table[RedisString, RedisString]]] = initTable[RedisString, Table[RedisString, Table[RedisString, RedisString]]]()
+  var top: TableRef[RedisString, TableRef[RedisString, TableRef[RedisString, RedisString]]] = newTable[RedisString, TableRef[RedisString, TableRef[RedisString, RedisString]]]()
   for item in x.listVal:
     let
       key = item.listVal[0].strVal
-      datas: Table[RedisString, Table[RedisString, RedisString]] = array2stream(item.listVal[1])
+      datas: TableRef[RedisString, TableRef[RedisString, RedisString]] = array2stream(item.listVal[1])
     top[key] = datas
   return top
 
 proc xread*(r: Redis | AsyncRedis, key: string, id: string,
-            count: int, timeout: int): Future[Table[RedisString, Table[RedisString, Table[RedisString, RedisString]]]] {.multisync.} =
+            count: int, timeout: int): Future[TableRef[RedisString, TableRef[RedisString, TableRef[RedisString, RedisString]]]] {.multisync.} =
   result = await r.xread(@[key], @[id], count, timeout)
 
 proc xtrim*(r: Redis | AsyncRedis, key: string, count: int): Future[RedisInteger] {.multisync.} =
